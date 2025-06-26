@@ -73,6 +73,22 @@ history = st.session_state.saved_chats.get(st.session_state.selected_chat, st.se
 
 # ---------- CHAT ZONE ----------
 st.markdown('<div class="chat-container">', unsafe_allow_html=True)
+
+# Hiển thị phần giới thiệu khi chưa có câu hỏi nào
+if not history:
+    st.markdown("""
+        ### 🤖 Xin chào! Tôi là **DaSci_BKchat**  
+        Đây là một sản phẩm dự thi **BKI 2025** của nhóm **UniPrompt Squad** gồm các thành viên:  
+        - Phạm Thùy Anh 
+        - Nguyễn Trung Nam 
+        - Nguyễn Thị Thanh Ngân
+        - Phạm Lê Quỳnh Như
+        - Nguyễn Ngọc Nhi
+        - Nguyễn Đỗ Bảo Long
+        <br>
+        Cùng với sự hỗ trợ của giáo viên hướng dẫn: **TS. Phan Thị Hường** và **TS. Nguyễn Tiến Dũng**.
+    """, unsafe_allow_html=True)
+
 for q, a in history:
     # User on right
     _, col_user = st.columns([2, 3])
