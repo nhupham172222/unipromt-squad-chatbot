@@ -42,7 +42,7 @@ wrapper_768 = ChromaEmbeddingWrapper768(
 )
 
 # 3) Kết nối Chroma
-client = chromadb.PersistentClient(path="/content/drive/MyDrive/chroma_store")
+client = chromadb.PersistentClient(path="./chroma_store")
 
 pdf_collection = client.get_or_create_collection(
     name="pdf_auto_khdl",
