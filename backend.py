@@ -42,10 +42,7 @@ wrapper_768 = ChromaEmbeddingWrapper768(
 )
 
 # 3) Kết nối Chroma
-import tempfile
-
-persist_dir = tempfile.mkdtemp()
-client = chromadb.PersistentClient(path=persist_dir)
+client = chromadb.Client()
 
 pdf_collection = client.get_or_create_collection(
     name="pdf_auto_khdl",
