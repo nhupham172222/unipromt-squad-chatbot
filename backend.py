@@ -19,8 +19,32 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 import chromadb
+from chromadb.config import Settings
 # 1) Khởi raw embedder cho Gemini text-embedding-004 (768-dim)
 raw_embedder = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004")
+
+# Chuẩn hóa embedding
+import numpy as np
+
+def normalize_batch(embeddings: np.ndarray) -> np.ndarray:
+    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+    norms = np.where(norms == 0, 1e-8, norms)
+    return embeddings / norms
+
+
+class NormalizedEmbedder:
+    def __init__(self, embedder):
+        self.embedder = embedder
+
+    def embed_documents(self, docs: list[str]) -> np.ndarray:
+        emb = self.embedder.embed_documents(docs)
+        return normalize_batch(emb)
+
+    def embed_query(self, query: str) -> np.ndarray:
+        return self.embed_documents([query])[0]
+
+# Bọc raw_embedder để tự normalize
+normalized_embedder = NormalizedEmbedder(raw_embedder)
 
 # 2) Wrapper đúng interface (tham số phải tên “input”)aa
 class ChromaEmbeddingWrapper768:
@@ -46,11 +70,21 @@ client = chromadb.Client()
 
 pdf_collection = client.get_or_create_collection(
     name="pdf_auto_khdl",
-    embedding_function=wrapper_768
+    embedding_function=wrapper_768,
+    metadata={
+        "hnsw:space": "cosine",
+        "hnsw:construction_ef": 200,   # sửa key ở đây
+        "hnsw:search_ef": 50           # (tuỳ chọn) tốc độ/ngưỡng tìm kiếm
+    }
 )
 excel_collection = client.get_or_create_collection(
     name="excel_manual_khdl",
-    embedding_function=wrapper_768
+    embedding_function=wrapper_768,
+    metadata={
+        "hnsw:space": "cosine",
+        "hnsw:construction_ef": 200,   # sửa key ở đây
+        "hnsw:search_ef": 50           # (tuỳ chọn) tốc độ/ngưỡng tìm kiếm
+    }
 )
 
 pdf_folder = "./BKI/Auto chunk"
@@ -66,25 +100,27 @@ PyPDFLoader
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 splitter = RecursiveCharacterTextSplitter(
     chunk_size=800,             # tăng lên để chứa đủ 1-2 đoạn ý liền mạch
-    chunk_overlap=100,          # vừa phải, đủ để không mất ngữ cảnh
+    chunk_overlap=200,          # vừa phải, đủ để không mất ngữ cảnh
     separators=["\n\n", "\n", ".", "!", "?", " ", ""]
 )
+pdf_chunks = []
 for file in pdf_files:
-    file_path = os.path.join(pdf_folder, file)  #lấy địa chỉ cụ thể của từng file trong folder
+    file_path = os.path.join(pdf_folder, file)#lấy địa chỉ cụ thể của từng file trong folder
     loader = PyPDFLoader(file_path)
     pages = loader.load()  # Mỗi trang là 1 Document
 
     full_text = "\n".join([page.page_content for page in pages])#Nối các trang trong file thành một đoạn
     chunks = splitter.split_text(full_text)  # → list[str]
+    pdf_chunks.extend(chunks)
     doc_id_base = "to_roi_KHDL_BMT_2025" # Tên file không đuôi
 
     documents = os.path.splitext(file)[0]
     metadatas = [{"source": doc_id_base, "content": chunk} for chunk in chunks]
     to_embed = [f"{documents} — {meta['content']}" for meta in metadatas]
-    embeddings = raw_embedder.embed_documents(to_embed)
+    embeddings = normalized_embedder.embed_documents(to_embed)
     ids = [f"{documents}_chunk_{i}" for i in range(len(chunks))]
      # Nạp vào collection
-    pdf_collection.add(
+    pdf_collection.upsert(
         documents=[documents] * len(chunks),  # tên file lặp lại
         metadatas=metadatas,
         embeddings=embeddings,
@@ -102,24 +138,84 @@ df = pd.read_excel("./BKI/Manual chunk/Data.xlsx")  # Hoặc đúng đường d�
 def format_bullets(raw: str) -> str:
     items = [s.strip() for s in str(raw).split(";") if s.strip()]
     return "\n".join(f"+ {it}" for it in items)
-
+excel_chunks = []
 for idx, row in df.iterrows():
     # a) Tạo document (tiêu đề) và content (nội dung đã format)
     documents = f"- {row['Doccument']}".strip()
     content = format_bullets(row["Content"])
     source = str(row["Source"])
     to_embed = [f"{documents} — {content}"]
+    excel_chunks.append(to_embed)
 
     # b) Embed ngay chuỗi đó (list độ dài = 1)
-    embedding = raw_embedder.embed_documents(to_embed)
-
+    embedding = normalized_embedder.embed_documents(to_embed)
     # c) Add vào collection
-    excel_collection.add(
+    excel_collection.upsert(
         documents=[documents],
         metadatas=[{"source": source, "content": content}],
         embeddings=embedding,
         ids=[f"doc{idx+1}"]
     )
+
+#Hybrid search (Embedding + BM25)
+from rank_bm25 import BM25Okapi
+def flatten_excel_chunks(raw_excel_chunks):
+    excel_chunks = []
+    for item in raw_excel_chunks:
+        # Nếu là list và không rỗng, lấy phần tử đầu
+        if isinstance(item, list) and len(item) > 0:
+            item = item[0]
+        # Nếu vẫn không phải string, chuyển thành string
+        if not isinstance(item, str):
+            item = str(item)
+        excel_chunks.append(item)
+    return excel_chunks
+excel_chunks = flatten_excel_chunks(excel_chunks)
+# 1) Tạo BM25 index cho mỗi nguồn
+pdf_tokenized   = [chunk.split() for chunk in pdf_chunks]
+excel_tokenized = [chunk.split() for chunk in excel_chunks]
+
+bm25_pdf   = BM25Okapi(pdf_tokenized)
+bm25_excel = BM25Okapi(excel_tokenized)
+
+# 2) Hybrid retrieval function
+def hybrid_retrieve(query: str, source: str, M: int = 50, K: int = 5, alpha: float = 0.3):
+    """
+    source: "pdf" hoặc "excel"
+    M: số chunk lấy từ BM25
+    K: số chunk cuối giữ lại
+    alpha: trọng số BM25 vs embedding
+    """
+    # Chọn đúng nơi
+    if source == "pdf":
+        chunks    = pdf_chunks
+        bm25      = bm25_pdf
+        emb_query = normalized_embedder.embed_query(query)
+    else:
+        chunks    = excel_chunks
+        bm25      = bm25_excel
+        emb_query = normalized_embedder.embed_query(query)
+
+    # 2.1) BM25 sơ bộ
+    q_tokens = query.split()
+    scores   = bm25.get_scores(q_tokens)
+    top_idx  = sorted(range(len(chunks)), key=lambda i: -scores[i])[:M]
+    cands    = [chunks[i]      for i in top_idx]
+    bm25_sc  = [scores[i]      for i in top_idx]
+
+    # 2.2) Embed và re-rank
+    cands_emb    = normalized_embedder.embed_documents(cands)  # (M×D)
+    cosine_sc    = np.dot(cands_emb, emb_query)               # (M,)
+
+    # 2.3) Normalize BM25 scores về [0,1]
+    mn, mx       = min(bm25_sc), max(bm25_sc)
+    bm25_norm    = [(s-mn)/(mx-mn+1e-8) for s in bm25_sc]
+
+    # 2.4) Kết hợp hybrid
+    hybrid_score = [alpha*b + (1-alpha)*c for b,c in zip(bm25_norm, cosine_sc)]
+    top_final    = sorted(range(len(hybrid_score)), key=lambda i: -hybrid_score[i])[:K]
+
+    return [cands[i] for i in top_final]
 
 #tính các điểm thành phần để tính điểm học lực
 def calculate_nang_luc(math_score: float, other_score_sum: float) -> dict:
@@ -331,21 +427,6 @@ llm = ChatGoogleGenerativeAI(
 from langchain.schema import Document, HumanMessage, SystemMessage, AIMessage
 import re
 # Hàm truy vấn ChromaDB
-def query_chroma(collection, query: str, top_k: int = 3) -> list[dict]:
-    # Embed câu hỏi
-    query_embedding = raw_embedder.embed_query(query)
-
-    # Truy vấn collection
-    results = collection.query(
-        query_embeddings=[query_embedding],
-        n_results=top_k
-    )
-
-    # Format kết quả
-    return [
-        [doc, {"content": meta["content"]}]
-        for doc, meta in zip(results["documents"][0], results["metadatas"][0])
-    ]
 def process_function_call(query: str, llm_with_tools) -> str:
     # System Prompt rõ ràng với ví dụ cụ thể messages
 
@@ -522,71 +603,53 @@ def classify_intent(query: str) -> str:
     if isinstance(response, AIMessage) and response.content:
         return response.content.strip()
     return "unknown"
-def process_query(query: str, llm_with_tools) -> str:
-    # 1. Phân loại intent
+
+def process_query(query: str, llm_model) -> str:
     intent = classify_intent(query)
 
-    # 2. Xử lý theo intent
     if intent == "auto_chunk":
-        # Truy vấn pdf_collection
-        results = query_chroma(pdf_collection, query)
-        print(results)
-        if results:
-          msgs = [
-            {"author": "system", "content": f"Tôi là trợ lý PDF. Thông tin:\n{results}"},
-            {"author": "user",   "content": query},
-        ]
-        return llm.predict(msgs).strip()
-        return "Không tìm thấy thông tin phù hợp trong PDF."
+        top_contexts = hybrid_retrieve(query, source="pdf")
+        if top_contexts:
+            context_str = "\n\n---\n\n".join(top_contexts)
+            msgs = [
+                SystemMessage(content='''Bạn là chuyên viên tư vấn tuyển sinh của bộ môn toán trường đại học bách khoa thành phố hồ chí minh.
+Nhiệm vụ của bạn là thu hút tuyển sinh cho ngành Khoa học dữ liệu của bộ môn toán.
+
+**Bạn tuân thủ những qui định sau**:
+- sử dụng thông tin trong context để trả lời
+- Bạn chỉ hỗ trợ trả lời cho ngành Khoa học Dữ liệu. Khi được hỏi về ngành khác thì từ chối trả lời.
+- Trả lời ngắn gọn, dễ quan sát, không chào hỏi hay cảm ơn.
+- Phong cách trả lời thân thiện, vui vẻ và ấm áp.'''),
+                HumanMessage(content=f"Context:\n{context_str}"),
+                HumanMessage(content=f"Câu hỏi: {query}")
+            ]
+            result = llm_model.invoke(msgs)
+            return result.content.strip()
+        else:
+            return "Không tìm thấy thông tin phù hợp trong PDF."
 
     elif intent == "manual_chunk":
-        # Truy vấn excel_collection
-        results = query_chroma(excel_collection, query)
-        print(results)
-        if results:
-          msgs = [
-            {"author": "system", "content": f"Tôi là trợ lý PDF. Thông tin:\n{results}"},
-            {"author": "user",   "content": query},
-        ]
-        return llm.predict(msgs).strip()
-        return "Không tìm thấy thông tin phù hợp trong Excel."
-    elif intent == "calculate_score":
-        return  process_function_call(query, llm_with_tools)
-    return "Không hiểu câu hỏi. Vui lòng hỏi lại."
-if __name__ == "__main__":
-    print("🌟 Chào bạn! Gõ 'exit' hoặc 'quit' để kết thúc phiên làm việc.\n")
-    while True:
-        query = input("Bạn: ").strip()
-        if query.lower() in ("exit", "quit"):
-            print("Chatbot: Hẹn gặp lại! 👋")
-            break
+        top_contexts = hybrid_retrieve(query, source="excel")
+        if top_contexts:
+            context_str = "\n\n---\n\n".join(top_contexts)
+            msgs = [
+                SystemMessage(content='''Bạn là chuyên viên tư vấn tuyển sinh của bộ môn toán trường đại học bách khoa thành phố hồ chí minh.
+Nhiệm vụ của bạn là thu hút tuyển sinh cho ngành Khoa học dữ liệu của bộ môn toán.
 
-        # 1. Phân loại intent
-        intent = classify_intent(query)
-        # 2. Xử lý theo intent
-        if intent == "auto_chunk":
-            results = query_chroma(pdf_collection, query)
-            if results:
-                msgs = [
-                    {"author": "system", "content": f"Tôi là trợ lý PDF. Thông tin:\n{results}"},
-                    {"author": "user",   "content": query},
-                ]
-                answer = llm.predict(msgs).strip()
-            else:
-                answer = "Không tìm thấy thông tin phù hợp trong PDF."
-        elif intent == "manual_chunk":
-            results = query_chroma(excel_collection, query)
-            if results:
-                msgs = [
-                    {"author": "system", "content": f"Tôi là trợ lý Excel. Thông tin:\n{results}"},
-                    {"author": "user",   "content": query},
-                ]
-                answer = llm.predict(msgs).strip()
-            else:
-                answer = "Không tìm thấy thông tin phù hợp trong Excel."
-        elif intent == "calculate_score":
-            answer = process_function_call(query, llm_with_tools)
+**Bạn tuân thủ những qui định sau**:
+- sử dụng thông tin trong context để trả lời
+- Bạn chỉ hỗ trợ trả lời cho ngành Khoa học Dữ liệu. Khi được hỏi về ngành khác thì từ chối trả lời.
+- Trả lời ngắn gọn, dễ quan sát, không chào hỏi hay cảm ơn.
+- Phong cách trả lời thân thiện, vui vẻ và ấm áp.'''),
+                HumanMessage(content=f"Context:\n{context_str}"),
+                HumanMessage(content=f"Câu hỏi: {query}")
+            ]
+            result = llm_model.invoke(msgs)
+            return result.content.strip()
         else:
-            answer = "Không hiểu câu hỏi. Vui lòng hỏi lại."
+            return "Không tìm thấy thông tin phù hợp trong Excel."
 
-        print(f"Chatbot: {answer}\n")
+    elif intent == "calculate_score":
+        return process_function_call(query, llm_model)
+    else:
+        return "Không hiểu câu hỏi. Vui lòng hỏi lại."
