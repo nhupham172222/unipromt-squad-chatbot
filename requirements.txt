@@ -11,3 +11,4 @@ setuptools
 openpyxl
 numpy
 rank-bm25
+streamlit-option-menu
