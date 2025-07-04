@@ -61,7 +61,7 @@ class ChromaEmbeddingWrapper768:
 
 # Tạo instance wrapper
 wrapper_768 = ChromaEmbeddingWrapper768(
-    raw_embedder,
+    normalized_embedder,
     name="text-embedding-004"   # tên model embedding chính xác
 )
 
@@ -99,9 +99,9 @@ PyPDFLoader
 )
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 splitter = RecursiveCharacterTextSplitter(
+    separators=["\n\n", "\n", ".", "?", "!"],
     chunk_size=800,             # tăng lên để chứa đủ 1-2 đoạn ý liền mạch
     chunk_overlap=200,          # vừa phải, đủ để không mất ngữ cảnh
-    separators=["\n\n", "\n", ".", "!", "?", " ", ""]
 )
 pdf_chunks = []
 for file in pdf_files:
@@ -426,157 +426,175 @@ llm = ChatGoogleGenerativeAI(
 
 from langchain.schema import Document, HumanMessage, SystemMessage, AIMessage
 import re
-# Hàm truy vấn ChromaDB
-def process_function_call(query: str, llm_with_tools) -> str:
-    # System Prompt rõ ràng với ví dụ cụ thể messages
+import inspect
+from typing import Dict, Any, Set, List
+# -------------------------------------------------------------------#
+#                   REGEX PATTERNS CHO SLOT-FILLING                   #
+# -------------------------------------------------------------------#
+PATTERNS: Dict[str, str] = {
+    "math_score":
+        r"(?:điểm\s*)?toán(?:\s*của\s*bài\s*thi\s*đánh\s*giá\s*năng\s*lực|\s*đánh\s*giá\s*năng\s*lực)?\s*(?:là|=|:|đc|được)?\s*(\d+\.?\d*)",
+    "other_score_sum":
+        r"tổng\s*điểm\s*(?:các\s*môn\s*(?:khác|còn\s*lại)(?:\s*của\s*bài\s*thi\s*đánh\s*giá\s*năng\s*lực)?)?\s*(?:là|=|:|đc|được)?\s*(\d+\.?\d*)",
+    "total_three_subjects":
+        r"(?:(?:tổng\s*điểm\s*)?(?:điểm\s*)?thi\s*thpt)\s*(?:là|=|:|đc|được)?\s*(\d+\.?\d*)",
+    "avg_grade_three_years":
+        r"trung\s*bình\s*(?:ba|3)\s*năm(?:\s*học)?\s*(?:là|=|:|đc|được)?\s*(\d+\.?\d*)",
+    "performance_bonus":
+        r"(?:điểm\s*)?(?:thành\s*tích|cộng)\s*(?:là|=|:|đc|được)?\s*(\d+\.?\d*)",
+    "priority_group_score":
+        r"ưu\s*tiên\s*(?:khu\s*vực|đối\s*tượng)?\s*(?:là|=|:|đc|được)?\s*(\d+\.?\d*)",
+}
 
-    messages = [
-        SystemMessage(content="""
-        Bạn là chatbot tính toán điểm tuyển sinh. Nhiệm vụ: nhận diện công cụ phù hợp và trích xuất tham số chính xác từ câu hỏi.
+# -------------------------------------------------------------------#
+#                MÔ TẢ THAM SỐ CHO PROMPT HỎI BỔ SUNG                 #
+# -------------------------------------------------------------------#
+DESCRIPTIONS: Dict[str, str] = {
+    "math_score": "Điểm toán của bài thi đánh giá năng lực",
+    "other_score_sum": "Tổng điểm các môn còn lại của bài thi đánh giá năng lực",
+    "total_three_subjects": "Tổng điểm thi THPT của 3 môn trong tổ hợp",
+    "avg_grade_three_years": "Điểm trung bình 3 năm học (lớp 10-11-12)",
+    "performance_bonus": "Điểm thành tích (mục cộng điểm)",
+    "priority_group_score": "Điểm ưu tiên khu vực/đối tượng",
+}
 
-        Hướng dẫn:
-        - Xác định công cụ dựa trên thông tin trong câu hỏi.
-        - Trích xuất tham số theo tên chính xác: math_score_ other_score_sum, total_three_subjects, avg_grade_three_years, performance_bonus, priority_group_score.
-        - Nếu thiếu tham số, trả về thông báo yêu cầu cung cấp đủ thông tin.
+# -------------------------------------------------------------------#
+#    MAPPING TỪ KHÓA → TOOL ĐỂ NHẬN DIỆN LIÊN TỤC (FALLBACK)          #
+# -------------------------------------------------------------------#
+DIRECT_TOOLS: Dict[str, str] = {
+    "điểm xét tuyển": "calculate_admission_score",
+    "điểm học lực": "calculate_academic_score",
+    "điểm năng lực": "calculate_nang_luc",
+    "tổng điểm thi": "calculate_thpt_test_converted",
+    "thi thpt": "calculate_thpt_test_converted",
+    "điểm thpt": "calculate_thpt_test_converted",
+    "học bạ": "calculate_hocba_converted",
+    "điểm học bạ": "calculate_hocba_converted",
+    "thành tích": "calculate_bonus",
+    "điểm cộng": "calculate_bonus",
+    "ưu tiên": "calculate_priority",
+}
 
-        Ví dụ:
-        1. 'Tính điểm năng lực với điểm Toán 8.5 và tổng các môn khác 16'
-           → Công cụ: calculate_nang_luc, tham số: math_score=8.5, other_score_sum=16.0
-        2. 'Tính điểm thi tốt nghiệp quy đổi với tổng điểm 3 môn là 27'
-           → Công cụ: calculate_thpt_test_converted, tham số: total_three_subjects=27.0
-        3. 'Tính điểm học bạ quy đổi với trung bình 3 năm là 8.5'
-           → Công cụ: calculate_hocba_converted, tham số: avg_grade_three_years=8.5
-        4. 'Tính điểm học lực với điểm Toán 8, tổng các môn khác 15, tổng điểm thi THPT 24, trung bình 3 năm 8'
-           → Công cụ: calculate_academic_score, tham số: math_score=8.0, other_score_sum=15.0, total_three_subjects=24.0, avg_grade_three_years=8.0
-        5. 'Tính điểm cộng với điểm học lực 80 và điểm thành tích 5'
-           → Công cụ: calculate_bonus, tham số: academic_score=80.0, performance_bonus=5.0
-        6. 'Tính điểm ưu tiên với điểm học lực 80, điểm thành tích 5, điểm ưu tiên nhóm 2'
-           → Công cụ: calculate_priority, tham số: academic_score=80.0, bonus=5.0, priority_group_score=2.0
-        7. 'Tính điểm xét tuyển với điểm Toán 8, tổng các môn khác 15, tổng điểm thi THPT 24, trung bình 3 năm 8, điểm thành tích 5, điểm ưu tiên nhóm 2'
-           → Công cụ: calculate_admission_score, tham số: math_score=8.0, other_score_sum=15.0, total_three_subjects=24.0, avg_grade_three_years=8.0, performance_bonus=5.0, priority_group_score=2.0
+# -------------------------------------------------------------------#
+#          HÀM TRÍCH THAM SỐ QUA REGEX                                #
+# -------------------------------------------------------------------#
+def _extract_with_regex(query: str, needed: Set[str]) -> Dict[str, float]:
+    text = query.lower()
+    found: Dict[str, float] = {}
+    for field in needed:
+        pattern = PATTERNS.get(field)
+        if not pattern:
+            continue
+        m = re.search(pattern, text)
+        if m:
+            try:
+                found[field] = float(m.group(1))
+            except ValueError:
+                pass
+    return found
 
-        Nếu không trích xuất được đủ tham số, trả về: 'Vui lòng cung cấp đủ thông tin (ví dụ: điểm Toán, tổng điểm các môn khác, tổng điểm thi THPT, trung bình 3 năm, điểm thành tích, điểm ưu tiên).'
-        """),
-        HumanMessage(content=query)
-    ]
+# -------------------------------------------------------------------#
+#    HÀM CHÍNH: SLOT-FILLING ĐA LƯỢT & TOOL CALL (CÓ RESET KHI TỪ KHÓA KHÔNG PHÙ HỢP)
+# -------------------------------------------------------------------#
+def process_function_call(query: str, llm_with_tools, tools: List[Any], memory: Dict[str, Any]) -> str:
+    """
+    Xử lý slot-filling đa lượt và gọi tool phù hợp.
 
-    response = llm_with_tools.invoke(messages)
+    memory lưu:
+      - pending_tool: tên tool đang chờ bổ sung
+      - args: dict các tham số đã trích được
+      - missing: Set[str] các tham số đang chờ
+    """
+    lower = query.lower()
+    args: Dict[str, Any] = {}
 
-    if response.tool_calls:
-        tool_call = response.tool_calls[0]
-        tool_name = tool_call['name']
-        tool_args = tool_call['args']
+    # Nếu đang chờ bổ sung nhưng user đổi topic không chứa bất kỳ missing field nào -> reset
+    if memory.get("pending_tool") and memory.get("missing"):
+        missing_prev: Set[str] = set(memory["missing"])
+        # kiểm tra query có pattern của missing_prev không
+        found_any = False
+        for field in missing_prev:
+            pat = PATTERNS.get(field)
+            if pat and re.search(pat, lower):
+                found_any = True
+                break
+        if not found_any:
+            memory.clear()
 
-        # Tìm công cụ tương ứng
-        for tool in tools:
-            if tool.name == tool_name:
-                # Lấy danh sách tham số bắt buộc từ args_schema
-                required_params = tool.args_schema.get("required", []) if isinstance(tool.args_schema, dict) else []
-
-                # Kiểm tra xem có đủ tham số không
-                if not tool_args or not all(param in tool_args for param in required_params):
-                    query_lower = query.lower()
-                    tool_args = {}
-
-                    if tool_name == "calculate_nang_luc":
-                        math_match = re.search(r"điểm\s*toán\s*[=:]?\s*(\d+\.?\d*)", query_lower)
-                        other_match = re.search(r"tổng\s*(?:điểm\s*)?các\s*môn\s*khác\s*[=:]?\s*(\d+\.?\d*)", query_lower)
-                        if math_match and other_match:
-                            tool_args = {
-                                "math_score": float(math_match.group(1)),
-                                "other_score_sum": float(other_match.group(1))
-                            }
-                    elif tool_name == "calculate_thpt_test_converted":
-                        score_match = re.search(r"tổng\s*điểm\s*(?:thi\s*)?(?:ba\s*môn)?\s*[=:]?\s*(\d+\.?\d*)", query_lower)
-                        if score_match:
-                            tool_args = {"total_three_subjects": float(score_match.group(1))}
-                    elif tool_name == "calculate_hocba_converted":
-                        avg_match = re.search(r"trung\s*bình\s*3\s*năm\s*[=:]?\s*(\d+\.?\d*)", query_lower)
-                        if avg_match:
-                            tool_args = {"avg_grade_three_years": float(avg_match.group(1))}
-                    elif tool_name == "calculate_academic_score":
-                        math_match = re.search(r"điểm\s*toán\s*[=:]?\s*(\d+\.?\d*)", query_lower)
-                        other_match = re.search(r"tổng\s*(?:điểm\s*)?các\s*môn\s*khác\s*[=:]?\s*(\d+\.?\d*)", query_lower)
-                        thpt_match = re.search(r"tổng\s*điểm\s*thi\s*thpt\s*[=:]?\s*(\d+\.?\d*)", query_lower)
-                        avg_match = re.search(r"trung\s*bình\s*3\s*năm\s*[=:]?\s*(\d+\.?\d*)", query_lower)
-                        if all([math_match, other_match, thpt_match, avg_match]):
-                            tool_args = {
-                                "math_score": float(math_match.group(1)),
-                                "other_score_sum": float(other_match.group(1)),
-                                "total_three_subjects": float(thpt_match.group(1)),
-                                "avg_grade_three_years": float(avg_match.group(1))
-                            }
-                    elif tool_name == "calculate_bonus":
-                        academic_match = re.search(r"điểm\s*học\s*lực\s*[=:]?\s*(\d+\.?\d*)", query_lower)
-                        bonus_match = re.search(r"điểm\s*thành\s*tích\s*[=:]?\s*(\d+\.?\d*)", query_lower)
-                        if academic_match and bonus_match:
-                            tool_args = {
-                                "academic_score": float(academic_match.group(1)),
-                                "performance_bonus": float(bonus_match.group(1))
-                            }
-                    elif tool_name == "calculate_priority":
-                        academic_match = re.search(r"điểm\s*học\s*lực\s*[=:]?\s*(\d+\.?\d*)", query_lower)
-                        bonus_match = re.search(r"điểm\s*thành\s*tích\s*[=:]?\s*(\d+\.?\d*)", query_lower)
-                        priority_match = re.search(r"điểm\s*ưu\s*tiên\s*(?:nhóm)?\s*[=:]?\s*(\d+\.?\d*)", query_lower)
-                        if all([academic_match, bonus_match, priority_match]):
-                            tool_args = {
-                                "academic_score": float(academic_match.group(1)),
-                                "bonus": float(bonus_match.group(1)),
-                                "priority_group_score": float(priority_match.group(1))
-                            }
-                    elif tool_name == "calculate_admission_score":
-                        math_match = re.search(r"điểm\s*toán\s*[=:]?\s*(\d+\.?\d*)", query_lower)
-                        other_match = re.search(r"tổng\s*(?:điểm\s*)?các\s*môn\s*khác\s*[=:]?\s*(\d+\.?\d*)", query_lower)
-                        thpt_match = re.search(r"tổng\s*điểm\s*thi\s*thpt\s*[=:]?\s*(\d+\.?\d*)", query_lower)
-                        avg_match = re.search(r"trung\s*bình\s*3\s*năm\s*[=:]?\s*(\d+\.?\d*)", query_lower)
-                        bonus_match = re.search(r"điểm\s*thành\s*tích\s*[=:]?\s*(\d+\.?\d*)", query_lower)
-                        priority_match = re.search(r"điểm\s*ưu\s*tiên\s*(?:nhóm)?\s*[=:]?\s*(\d+\.?\d*)", query_lower)
-                        if all([math_match, other_match, thpt_match, avg_match, bonus_match, priority_match]):
-                            tool_args = {
-                                "math_score": float(math_match.group(1)),
-                                "other_score_sum": float(other_match.group(1)),
-                                "total_three_subjects": float(thpt_match.group(1)),
-                                "avg_grade_three_years": float(avg_match.group(1)),
-                                "performance_bonus": float(bonus_match.group(1)),
-                                "priority_group_score": float(priority_match.group(1))
-                            }
-
-                try:
-                    # Kiểm tra xem tất cả tham số bắt buộc có trong tool_args không
-                    if tool_args and all(param in tool_args for param in required_params):
-                        result = tool.func(**tool_args)
-                        if tool_name == "calculate_nang_luc":
-                            return f"Điểm năng lực: {result['nang_luc_score']}"
-                        elif tool_name == "calculate_thpt_test_converted":
-                            return f"Điểm thi THPT quy đổi: {result['thpt_test_converted']}"
-                        elif tool_name == "calculate_hocba_converted":
-                            return f"Điểm học bạ quy đổi: {result['hocba_converted']}"
-                        elif tool_name == "calculate_academic_score":
-                            return (f"Điểm học lực: {result['academic_score']}\n"
-                                    f"Chi tiết: Điểm năng lực = {result['nang_luc_score']}, "
-                                    f"Điểm thi THPT quy đổi = {result['thpt_test_converted']}, "
-                                    f"Điểm học bạ quy đổi = {result['hocba_converted']}")
-                        elif tool_name == "calculate_bonus":
-                            return f"Điểm cộng: {result['bonus']}"
-                        elif tool_name == "calculate_priority":
-                            return f"Điểm ưu tiên: {result['priority']}"
-                        elif tool_name == "calculate_admission_score":
-                            return (f"Điểm xét tuyển: {result['admission_score']}\n"
-                                    f"Chi tiết: Điểm học lực = {result['academic_score']}, "
-                                    f"Điểm năng lực = {result['nang_luc_score']}, "
-                                    f"Điểm thi THPT quy đổi = {result['thpt_test_converted']}, "
-                                    f"Điểm học bạ quy đổi = {result['hocba_converted']}, "
-                                    f"Điểm cộng = {result['bonus']}, "
-                                    f"Điểm ưu tiên = {result['priority']}")
-                    else:
-                        return (f"Lỗi: Vui lòng cung cấp đủ thông tin cho {tool_name}. "
-                                f"Yêu cầu: {', '.join(required_params)}. "
-                                f"Ví dụ: '{tool.description.split('.')[0]}'.")
-                except Exception as e:
-                    return f"Lỗi khi gọi tool: {str(e)}"
-        return f"Không tìm thấy tool: {tool_name}"
+    # 1️⃣ Lấy tool_name & args ban đầu
+    if memory.get("pending_tool"):
+        tool_name = memory["pending_tool"]
+        args = memory.get("args", {})
     else:
-        return "Không nhận diện được công cụ. Vui lòng kiểm tra câu hỏi. Ví dụ: 'Tính điểm xét tuyển với điểm Toán 8, tổng các môn khác 15, tổng điểm thi THPT 24, trung bình 3 năm 8, điểm thành tích 5, điểm ưu tiên nhóm 2'."
+        tool_name = None
+        # 1a) nhận diện nhanh qua từ khóa
+        for key, name in DIRECT_TOOLS.items():
+            if key in lower:
+                tool_name = name
+                break
+        # 1b) nếu không nhận diện -> nhờ LLM
+        if not tool_name:
+            sys_prompt = "Bạn là chatbot tính toán điểm tuyển sinh. Nhận diện tool và trích args."
+            msgs = [SystemMessage(content=sys_prompt), HumanMessage(content=query)]
+            resp = llm_with_tools.invoke(msgs)
+            if resp.tool_calls:
+                tc = resp.tool_calls[0]
+                tool_name = tc["name"]
+                args = tc.get("args", {})
+            else:
+                return "Xin lỗi, mình chưa xác định được phép tính bạn cần."
+        # reset trạng thái cũ
+        memory.clear()
+
+    # 2️⃣ Tìm tool object
+    tool = next((t for t in tools if t.name == tool_name), None)
+    if not tool:
+        return f"Không tìm thấy tool {tool_name}."
+
+    # 3️⃣ Xác định tham số bắt buộc
+    sig = inspect.signature(tool.func)
+    required: Set[str] = {param for param, p in sig.parameters.items() if p.default is inspect._empty}
+
+    # 4️⃣ Extract missing qua regex
+    missing = required - set(args.keys())
+    extra = _extract_with_regex(query, missing)
+    args.update(extra)
+    missing -= set(extra.keys())
+
+    # 5️⃣ Nếu thiếu -> hỏi user, lưu lại missing
+    if missing:
+        memory["pending_tool"] = tool_name
+        memory["args"] = args
+        memory["missing"] = list(missing)
+        descs = [DESCRIPTIONS.get(p, p) for p in missing]
+        return f"Bạn có thể cung cấp thêm {', '.join(descs)} cho mình được không?"
+
+    # 6️⃣ Đủ tham số -> gọi tool
+    try:
+        result = tool.func(**args)
+    except Exception as e:
+        memory.clear()
+        return f"Lỗi khi gọi tool: {e}"
+    memory.clear()
+
+    # 7️⃣ Trả kết quả format
+    if tool_name == "calculate_admission_score":
+        return f"✅ Điểm xét tuyển: {result['admission_score']}"
+    if tool_name == "calculate_academic_score":
+        return f"✅ Điểm học lực: {result['academic_score']}"
+    if tool_name == "calculate_nang_luc":
+        return f"✅ Điểm năng lực: {result['nang_luc_score']}"
+    if tool_name == "calculate_thpt_test_converted":
+        return f"✅ Điểm thi THPT quy đổi: {result['thpt_test_converted']}"
+    if tool_name == "calculate_hocba_converted":
+        return f"✅ Điểm học bạ quy đổi: {result['hocba_converted']}"
+    if tool_name == "calculate_bonus":
+        return f"✅ Điểm cộng: {result['bonus']}"
+    if tool_name == "calculate_priority":
+        return f"✅ Điểm ưu tiên: {result['priority']}"
+
+    return str(result)
+
 # Prompt template cho intent classification
 intent_prompt_template = """
 Bạn là một chatbot hỗ trợ tư vấn tuyển sinh. Phân loại ý định (intent) của câu hỏi sau thành một trong ba loại:
@@ -604,10 +622,16 @@ def classify_intent(query: str) -> str:
         return response.content.strip()
     return "unknown"
 
-def process_query(query: str, llm_model) -> str:
+def process_query(query: str, llm_model, memory: Dict[str, Any] = None) -> str:
+    if memory is None:
+        memory = {}
+
+    # 1. Phân loại intent
     intent = classify_intent(query)
 
+    # 2. Xử lý theo intent
     if intent == "auto_chunk":
+        # Hybrid search cho PDF
         top_contexts = hybrid_retrieve(query, source="pdf")
         if top_contexts:
             context_str = "\n\n---\n\n".join(top_contexts)
@@ -629,6 +653,7 @@ Nhiệm vụ của bạn là thu hút tuyển sinh cho ngành Khoa học dữ li
             return "Không tìm thấy thông tin phù hợp trong PDF."
 
     elif intent == "manual_chunk":
+        # Hybrid search cho Excel
         top_contexts = hybrid_retrieve(query, source="excel")
         if top_contexts:
             context_str = "\n\n---\n\n".join(top_contexts)
@@ -650,6 +675,8 @@ Nhiệm vụ của bạn là thu hút tuyển sinh cho ngành Khoa học dữ li
             return "Không tìm thấy thông tin phù hợp trong Excel."
 
     elif intent == "calculate_score":
-        return process_function_call(query, llm_model)
+        return process_function_call(query, llm_model, tools, memory)
+
     else:
         return "Không hiểu câu hỏi. Vui lòng hỏi lại."
+    
